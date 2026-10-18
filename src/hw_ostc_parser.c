@@ -734,8 +734,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 	// Check the header length.
 	if (version == 0x23 || version == 0x24) {
 		if (size < header + 5) {
-			ERROR (abstract->context, "Buffer overflow detected!");
-			return DC_STATUS_DATAFORMAT;
+			WARNING (abstract->context, "Profile small-header missing (size=%u < %u). Treating as empty.", size, header + 5);
+			parser->cached = PROFILE;
+			return DC_STATUS_SUCCESS;
 		}
 	}
 
@@ -760,8 +761,11 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 	// Check the header length.
 	if (version == 0x23 || version == 0x24) {
 		if (size < header + 5 + 3 * nconfig) {
-			ERROR (abstract->context, "Buffer overflow detected!");
-			return DC_STATUS_DATAFORMAT;
+			// Profile small-header is truncated (e.g. BLE download cut short).
+			// Treat as empty profile so the dive header fields still parse.
+			WARNING (abstract->context, "Truncated profile header (%u of %u bytes). Treating as empty.", size, header + 5 + 3 * nconfig);
+			parser->cached = PROFILE;
+			return DC_STATUS_SUCCESS;
 		}
 	}
 
@@ -838,7 +842,12 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 	unsigned int offset = header;
 	if (version == 0x23 || version == 0x24)
 		offset += 5 + 3 * nconfig;
+	unsigned int truncated = 0;
 	while (offset + 3 <= size) {
+		// FD FD is the end-of-profile marker; stop before parsing it as sample data.
+		if (data[offset] == 0xFD && data[offset + 1] == 0xFD)
+			break;
+
 		dc_sample_value_t sample = {0};
 
 		nsamples++;
@@ -870,6 +879,12 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 
 		// Depth (1/100 m).
 		unsigned int depth = array_uint16_le (data + offset);
+		// Guard: 0xFD 0xFD is the end-of-profile marker; detect it before
+		// emitting a garbage ~650 m depth sample.
+		if (data[offset] == 0xFD && data[offset + 1] == 0xFD) {
+			truncated = 1;
+			goto truncated_profile;
+		}
 		sample.depth = depth / 100.0;
 		if (callback) callback (DC_SAMPLE_DEPTH, &sample, userdata);
 		offset += 2;
@@ -880,8 +895,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 
 		// Check for buffer overflows.
 		if (offset + length > size) {
-			ERROR (abstract->context, "Buffer overflow detected!");
-			return DC_STATUS_DATAFORMAT;
+			WARNING (abstract->context, "Buffer overflow (offset=%u + length=%u > size=%u). Truncated profile.", offset, length, size);
+			truncated = 1;
+			goto truncated_profile;
 		}
 
 		// Get the event byte(s).
@@ -891,8 +907,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			if (nbits && version != 0x23 && version != 0x24)
 				break;
 			if (length < 1) {
-				ERROR (abstract->context, "Buffer overflow detected!");
-				return DC_STATUS_DATAFORMAT;
+				WARNING (abstract->context, "Buffer overflow in event bytes. Truncated profile.");
+				truncated = 1;
+				goto truncated_profile;
 			}
 			events |= data[offset] << nbits;
 			nbits += 8;
@@ -935,8 +952,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 		// Manual Gas Set & Change
 		if (events & 0x10) {
 			if (length < 2) {
-				ERROR (abstract->context, "Buffer overflow detected!");
-				return DC_STATUS_DATAFORMAT;
+				WARNING (abstract->context, "Buffer overflow in manual gas set. Truncated profile.");
+				truncated = 1;
+				goto truncated_profile;
 			}
 			unsigned int o2 = data[offset];
 			unsigned int he = data[offset + 1];
@@ -965,8 +983,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 		// Gas Change
 		if (events & 0x20) {
 			if (length < 1) {
-				ERROR (abstract->context, "Buffer overflow detected!");
-				return DC_STATUS_DATAFORMAT;
+				WARNING (abstract->context, "Buffer overflow in gas change. Truncated profile.");
+				truncated = 1;
+				goto truncated_profile;
 			}
 			unsigned int id = data[offset];
 			if (ISHWOS4(parser->hwos, parser->model) && ccr && id > parser->nfixed) {
@@ -990,8 +1009,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			// SetPoint Change
 			if (events & 0x40) {
 				if (length < 1) {
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in setpoint change. Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 				sample.setpoint = data[offset] / 100.0;
 				if (callback) callback (DC_SAMPLE_SETPOINT, &sample, userdata);
@@ -1002,8 +1022,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			// Bailout Event
 			if (events & 0x0100) {
 				if (length < 2) {
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in bailout event. Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 
 				unsigned int o2 = data[offset];
@@ -1033,8 +1054,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			// Compass heading
 			if (events & 0x0200) {
 				if (length < 2) {
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in compass. Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 
 				unsigned int value = array_uint16_le (data + offset);
@@ -1052,8 +1074,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			// GNSS position
 			if (events & 0x0400) {
 				if (length < 8) {
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in GNSS. Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 
 				float longitude = array_float_le (data + offset);
@@ -1074,8 +1097,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			// Scrubber state
 			if (events & 0x0800) {
 				if (length < 2) {
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in scrubber. Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 
 				unsigned int value = array_uint16_le (data + offset);
@@ -1101,8 +1125,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 						info[i].divisor = 0;
 						continue;
 					}
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in extended sample info. Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 
 				unsigned int ppo2[3] = {0};
@@ -1182,8 +1207,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			// SetPoint Change
 			if (events & 0x40) {
 				if (length < 1) {
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in setpoint (non-hwOS4). Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 				sample.setpoint = data[offset] / 100.0;
 				if (callback) callback (DC_SAMPLE_SETPOINT, &sample, userdata);
@@ -1194,8 +1220,9 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 			// Bailout Event
 			if (events & 0x80) {
 				if (length < 2) {
-					ERROR (abstract->context, "Buffer overflow detected!");
-					return DC_STATUS_DATAFORMAT;
+					WARNING (abstract->context, "Buffer overflow in bailout (non-hwOS4). Truncated profile.");
+					truncated = 1;
+					goto truncated_profile;
 				}
 
 				unsigned int o2 = data[offset];
@@ -1230,7 +1257,10 @@ hw_ostc_parser_internal_foreach (hw_ostc_parser_t *parser, dc_sample_callback_t 
 		offset += length;
 	}
 
-	if (offset + 2 > size || data[offset] != 0xFD || data[offset + 1] != 0xFD) {
+truncated_profile:
+	if (truncated) {
+		WARNING (abstract->context, "Profile truncated at offset %u/%u, %u sample(s) parsed. Using header fields for summary values.", offset, size, nsamples);
+	} else if (offset + 2 > size || data[offset] != 0xFD || data[offset + 1] != 0xFD) {
 		ERROR (abstract->context, "Invalid end marker found!");
 		return DC_STATUS_DATAFORMAT;
 	}
