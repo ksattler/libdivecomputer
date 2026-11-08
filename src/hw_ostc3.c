@@ -524,6 +524,11 @@ hw_ostc3_transfer (hw_ostc3_device_t *device,
 						dc_iostream_purge (device->iostream, DC_DIRECTION_INPUT);
 					}
 				}
+				// The device sometimes drops blocks of the profile on BLE
+				// (OSTC 5); make a short profile visible in the log.
+				if (got + 16 < profile_max) {
+					WARNING (abstract->context, "Profile shorter than announced: received %zu of %zu bytes.", got, profile_max);
+				}
 				length = RB_LOGBOOK_SIZE_FULL + (unsigned int)got;
 				if (progress) {
 					device_event_emit ((dc_device_t *) device, DC_EVENT_PROGRESS, progress);
