@@ -123,6 +123,10 @@ typedef struct hw_ostc3_device_t {
 	unsigned int firmware;
 	unsigned char fingerprint[5];
 	hw_ostc3_state_t state;
+	// Optional dive selection (libdc-swift): concatenated fingerprints of the
+	// dives foreach downloads. NULL downloads all dives up to the fingerprint.
+	unsigned char *selection;
+	unsigned int nselection;
 } hw_ostc3_device_t;
 
 typedef struct hw_ostc3_logbook_t {
@@ -594,6 +598,8 @@ hw_ostc3_device_open (dc_device_t **out, dc_context_t *context, dc_iostream_t *i
 	device->serial = 0;
 	device->firmware = 0;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
+	device->selection = NULL;
+	device->nselection = 0;
 
 	// Create the packet stream.
 	if (transport == DC_TRANSPORT_BLE) {
@@ -819,6 +825,10 @@ hw_ostc3_device_close (dc_device_t *abstract)
 	hw_ostc3_device_t *device = (hw_ostc3_device_t*) abstract;
 	dc_status_t rc = DC_STATUS_SUCCESS;
 
+	free (device->selection);
+	device->selection = NULL;
+	device->nselection = 0;
+
 	// Send the exit command
 	if (device->state == DOWNLOAD || device->state == SERVICE) {
 		rc = hw_ostc3_transfer (device, NULL, EXIT, NULL, 0, NULL, 0, NULL, NODELAY);
@@ -910,6 +920,318 @@ hw_ostc3_device_hardware (dc_device_t *abstract, unsigned char data[], unsigned 
 }
 
 
+dc_status_t
+hw_ostc3_device_set_selection (dc_device_t *abstract, const unsigned char data[], unsigned int count)
+{
+	hw_ostc3_device_t *device = (hw_ostc3_device_t *) abstract;
+
+	if (!ISINSTANCE (abstract))
+		return DC_STATUS_INVALIDARGS;
+
+	if (count && data == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	free (device->selection);
+	device->selection = NULL;
+	device->nselection = 0;
+
+	if (count == 0)
+		return DC_STATUS_SUCCESS;
+
+	device->selection = (unsigned char *) malloc (count * sizeof (device->fingerprint));
+	if (device->selection == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	memcpy (device->selection, data, count * sizeof (device->fingerprint));
+	device->nselection = count;
+
+	return DC_STATUS_SUCCESS;
+}
+
+
+static int
+hw_ostc3_is_selected (hw_ostc3_device_t *device, const unsigned char fingerprint[])
+{
+	if (device->selection == NULL)
+		return 1;
+
+	for (unsigned int i = 0; i < device->nselection; ++i) {
+		if (memcmp (device->selection + i * sizeof (device->fingerprint), fingerprint, sizeof (device->fingerprint)) == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+
+/*
+ * Profile length of the dive with the given logbook entry, as transmitted by
+ * the DIVE command.
+ */
+static unsigned int
+hw_ostc3_profile_length (hw_ostc3_device_t *device, const unsigned char entry[], const hw_ostc3_logbook_t *logbook, unsigned int compact)
+{
+	unsigned int length = 0;
+	if (device->frog) {
+		// Get the ringbuffer pointers.
+		unsigned int begin = array_uint24_le (entry + logbook->pointers);
+		unsigned int end   = array_uint24_le (entry + logbook->pointers + 3);
+
+		length = RB_LOGBOOK_SIZE_FULL + RB_PROFILE_DISTANCE (begin, end) - 6;
+	} else {
+		length = RB_LOGBOOK_SIZE_FULL + array_uint24_le (entry + logbook->profile) - 3;
+		if (!compact) {
+			// Workaround for a bug in older firmware versions.
+			unsigned int firmware = array_uint16_be (entry + logbook->firmware);
+			if (firmware < OSTC3FW(0,93))
+				length -= 3;
+		}
+	}
+	// OSTC 4/5 firmware stores the profile length in the (compact) dive
+	// header 3 bytes higher than what is actually transmitted in the dive
+	// download response. The same delta is already encoded for the
+	// post-download validation step (see `delta = ISHWOS4(...) ? 3 : 0`).
+	// Without this correction the read of the dive profile expects 3 more
+	// bytes than the OSTC sends and times out with DC_STATUS_IO.
+	if (ISHWOS4(device->hardware))
+		length -= 3;
+
+	return length;
+}
+
+
+/*
+ * Downloads the logbook headers (compact if supported, full otherwise) and
+ * collects the indexes of all valid dives, newest first. Stops at the
+ * fingerprint unless list_all is set or a selection is active; applies the
+ * selection unless list_all is set.
+ */
+static dc_status_t
+hw_ostc3_device_logbook (hw_ostc3_device_t *device, dc_event_progress_t *progress, int list_all,
+	unsigned char header[], unsigned int *out_compact, const hw_ostc3_logbook_t **out_logbook,
+	unsigned char dive[], unsigned int *out_ndives, unsigned int *out_size, unsigned int *out_maxsize)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t rc = DC_STATUS_SUCCESS;
+
+	// Download the compact logbook headers. If the firmware doesn't support
+	// compact headers yet, fallback to downloading the full logbook headers.
+	// This is slower, but also works for older firmware versions.
+	unsigned int compact = 1;
+	if (!device->frog) {
+		rc = hw_ostc3_transfer (device, progress, COMPACT,
+				NULL, 0, header, RB_LOGBOOK_SIZE_COMPACT * RB_LOGBOOK_COUNT, NULL, NODELAY);
+	} else {
+		rc = DC_STATUS_UNSUPPORTED;
+	}
+	if (rc == DC_STATUS_UNSUPPORTED) {
+		compact = 0;
+		rc = hw_ostc3_transfer (device, progress, HEADER,
+		          NULL, 0, header, RB_LOGBOOK_SIZE_FULL * RB_LOGBOOK_COUNT, NULL, NODELAY);
+	}
+	if (rc != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to read the header.");
+		return rc;
+	}
+
+	// Get the correct logbook layout.
+	const hw_ostc3_logbook_t *logbook = NULL;
+	if (compact) {
+		logbook = &hw_ostc3_logbook_compact;
+	} else {
+		logbook = &hw_ostc3_logbook_full[device->frog];
+	}
+
+	// Locate the most recent dive.
+	// The device maintains an internal counter which is incremented for every
+	// dive, and the current value at the time of the dive is stored in the
+	// dive header. Thus the most recent dive will have the highest value.
+	unsigned int latest = 0;
+	unsigned int maximum = 0;
+	for (unsigned int i = 0; i < RB_LOGBOOK_COUNT; ++i) {
+		unsigned int offset = i * logbook->size;
+
+		// Ignore uninitialized header entries.
+		if (array_isequal (header + offset, logbook->size, 0xFF))
+			continue;
+
+		// Get the internal dive number.
+		unsigned int current = array_uint16_le (header + offset + logbook->number);
+		if (current > maximum || ISHWOS4(device->hardware)) {
+			maximum = current;
+			latest = i;
+		}
+	}
+
+	// With a selection, older dives are wanted too, so the fingerprint is ignored.
+	int stop_at_fingerprint = !list_all && device->selection == NULL;
+
+	// Calculate the total and maximum size.
+	unsigned int ndives = 0;
+	unsigned int size = 0;
+	unsigned int maxsize = 0;
+	for (unsigned int i = 0; i < RB_LOGBOOK_COUNT; ++i) {
+		unsigned int idx = (latest + RB_LOGBOOK_COUNT - i) % RB_LOGBOOK_COUNT;
+		unsigned int offset = idx * logbook->size;
+
+		// Ignore uninitialized header entries.
+		if (array_isequal (header + offset, logbook->size, 0xFF)) {
+			WARNING (abstract->context, "Unexpected empty header found.");
+			continue;
+		}
+
+		if (device->frog) {
+			// Validate the ringbuffer pointers.
+			unsigned int begin = array_uint24_le (header + offset + logbook->pointers);
+			unsigned int end   = array_uint24_le (header + offset + logbook->pointers + 3);
+			if (begin < RB_PROFILE_BEGIN ||
+				begin >= RB_PROFILE_END ||
+				end < RB_PROFILE_BEGIN ||
+				end >= RB_PROFILE_END)
+			{
+				ERROR (abstract->context, "Invalid ringbuffer pointer detected (0x%06x 0x%06x).", begin, end);
+				return DC_STATUS_DATAFORMAT;
+			}
+		}
+
+		// Calculate the profile length.
+		unsigned int length = hw_ostc3_profile_length (device, header + offset, logbook, compact);
+		if (length < RB_LOGBOOK_SIZE_FULL) {
+			WARNING (abstract->context, "Skipping dive entry %u: profile length too small (%u bytes).", idx, length);
+			continue;
+		}
+		// Guard against corrupt headers with an implausibly large profile
+		// length (e.g. flash-erased slots with non-0xFF residue). Requesting
+		// such a transfer from the OSTC4/5 causes the firmware to disconnect.
+		if (length > SZ_MEMORY) {
+			WARNING (abstract->context, "Skipping dive entry %u: profile length (%u bytes) exceeds flash size.", idx, length);
+			continue;
+		}
+
+		const unsigned char *fingerprint = header + offset + logbook->fingerprint;
+
+		// Check the fingerprint data.
+		if (stop_at_fingerprint && memcmp (fingerprint, device->fingerprint, sizeof (device->fingerprint)) == 0)
+			break;
+
+		if (!list_all && !hw_ostc3_is_selected (device, fingerprint))
+			continue;
+
+		if (length > maxsize)
+			maxsize = length;
+		size += length;
+		dive[ndives] = idx;
+		ndives++;
+	}
+
+	*out_compact = compact;
+	*out_logbook = logbook;
+	*out_ndives = ndives;
+	if (out_size)
+		*out_size = size;
+	if (out_maxsize)
+		*out_maxsize = maxsize;
+
+	return DC_STATUS_SUCCESS;
+}
+
+
+/*
+ * Start time of the dive with the given logbook entry, computed like
+ * hw_ostc_parser_get_datetime. Older formats store the end of the dive; the
+ * compact header has no total duration, so for format 0x23 the start is
+ * approximated with the dive time (excluding shallow parts).
+ */
+static int
+hw_ostc3_entry_datetime (hw_ostc3_device_t *device, const unsigned char entry[], const hw_ostc3_logbook_t *logbook, unsigned int compact, dc_datetime_t *datetime)
+{
+	const unsigned char *p = entry + logbook->fingerprint;
+	unsigned int version = entry[logbook->version];
+	// Offsets relative to the datetime, see the parser layouts.
+	unsigned int divetime_offset = logbook->fingerprint + 7;
+	unsigned int duration_offset = device->frog ? 47 : 75;
+
+	dc_datetime_t dt;
+	if (version == 0x23 || version == 0x24) {
+		dt.year   = p[0] + 2000;
+		dt.month  = p[1];
+		dt.day    = p[2];
+	} else {
+		dt.year   = p[2] + 2000;
+		dt.month  = p[0];
+		dt.day    = p[1];
+	}
+	dt.hour   = p[3];
+	dt.minute = p[4];
+	dt.second = 0;
+	dt.timezone = DC_TIMEZONE_NONE;
+
+	if (version == 0x24) {
+		*datetime = dt;
+		return 1;
+	}
+
+	unsigned int divetime = 0;
+	if (version > 0x20 && !compact) {
+		divetime = (array_uint16_le (entry + duration_offset) / 60) * 60;
+	} else {
+		divetime = array_uint16_le (entry + divetime_offset) * 60 + entry[divetime_offset + 2];
+	}
+
+	dc_ticks_t ticks = dc_datetime_mktime (&dt);
+	if (ticks == (dc_ticks_t) -1)
+		return 0;
+	ticks -= divetime;
+	if (!dc_datetime_gmtime (datetime, ticks))
+		return 0;
+	datetime->timezone = DC_TIMEZONE_NONE;
+	return 1;
+}
+
+
+dc_status_t
+hw_ostc3_device_list (dc_device_t *abstract, hw_ostc3_list_callback_t callback, void *userdata)
+{
+	hw_ostc3_device_t *device = (hw_ostc3_device_t *) abstract;
+
+	if (!ISINSTANCE (abstract))
+		return DC_STATUS_INVALIDARGS;
+
+	dc_event_progress_t progress = EVENT_PROGRESS_INITIALIZER;
+	progress.maximum = RB_LOGBOOK_SIZE_FULL * RB_LOGBOOK_COUNT;
+	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
+
+	dc_status_t rc = hw_ostc3_device_init (device, DOWNLOAD);
+	if (rc != DC_STATUS_SUCCESS)
+		return rc;
+
+	unsigned char *header = (unsigned char *) malloc (RB_LOGBOOK_SIZE_FULL * RB_LOGBOOK_COUNT);
+	if (header == NULL) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		return DC_STATUS_NOMEMORY;
+	}
+
+	unsigned int compact = 0, ndives = 0;
+	const hw_ostc3_logbook_t *logbook = NULL;
+	unsigned char dive[RB_LOGBOOK_COUNT] = {0};
+	rc = hw_ostc3_device_logbook (device, &progress, 1, header, &compact, &logbook, dive, &ndives, NULL, NULL);
+	if (rc == DC_STATUS_SUCCESS && callback) {
+		for (unsigned int i = 0; i < ndives; ++i) {
+			const unsigned char *entry = header + dive[i] * logbook->size;
+			dc_datetime_t datetime;
+			int have_datetime = hw_ostc3_entry_datetime (device, entry, logbook, compact, &datetime);
+			if (!callback (entry + logbook->fingerprint, sizeof (device->fingerprint),
+					have_datetime ? &datetime : NULL, userdata))
+				break;
+		}
+	}
+
+	free (header);
+
+	return rc;
+}
+
+
 static dc_status_t
 hw_ostc3_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata)
 {
@@ -938,131 +1260,20 @@ hw_ostc3_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, voi
 		return DC_STATUS_NOMEMORY;
 	}
 
-	// Download the compact logbook headers. If the firmware doesn't support
-	// compact headers yet, fallback to downloading the full logbook headers.
-	// This is slower, but also works for older firmware versions.
-	unsigned int compact = 1;
-	if (!device->frog) {
-		rc = hw_ostc3_transfer (device, &progress, COMPACT,
-				NULL, 0, header, RB_LOGBOOK_SIZE_COMPACT * RB_LOGBOOK_COUNT, NULL, NODELAY);
-	} else {
-		rc = DC_STATUS_UNSUPPORTED;
-	}
-	if (rc == DC_STATUS_UNSUPPORTED) {
-		compact = 0;
-		rc = hw_ostc3_transfer (device, &progress, HEADER,
-		          NULL, 0, header, RB_LOGBOOK_SIZE_FULL * RB_LOGBOOK_COUNT, NULL, NODELAY);
-	}
+	// Get the correct header layout.
+	const hw_ostc3_logbook_t *layout = &hw_ostc3_logbook_full[device->frog];
+
+	// Read the logbook and collect the dives to download.
+	unsigned int compact = 0, ndives = 0, size = 0, maxsize = 0;
+	const hw_ostc3_logbook_t *logbook = NULL;
+	unsigned char dive[RB_LOGBOOK_COUNT] = {0};
+	rc = hw_ostc3_device_logbook (device, &progress, 0, header, &compact, &logbook, dive, &ndives, &size, &maxsize);
 	if (rc != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to read the header.");
 		free (header);
 		return rc;
 	}
 
-	// Get the correct header layout.
-	const hw_ostc3_logbook_t *layout = &hw_ostc3_logbook_full[device->frog];
-
-	// Get the correct logbook layout.
-	const hw_ostc3_logbook_t *logbook = NULL;
-	if (compact) {
-		logbook = &hw_ostc3_logbook_compact;
-	} else {
-		logbook = layout;
-	}
-
-	// Locate the most recent dive.
-	// The device maintains an internal counter which is incremented for every
-	// dive, and the current value at the time of the dive is stored in the
-	// dive header. Thus the most recent dive will have the highest value.
-	unsigned int latest = 0;
-	unsigned int maximum = 0;
-	for (unsigned int i = 0; i < RB_LOGBOOK_COUNT; ++i) {
-		unsigned int offset = i * logbook->size;
-
-		// Ignore uninitialized header entries.
-		if (array_isequal (header + offset, logbook->size, 0xFF))
-			continue;
-
-		// Get the internal dive number.
-		unsigned int current = array_uint16_le (header + offset + logbook->number);
-		if (current > maximum || ISHWOS4(device->hardware)) {
-			maximum = current;
-			latest = i;
-		}
-	}
-
-	// Calculate the total and maximum size.
-	unsigned int ndives = 0;
-	unsigned int size = 0;
-	unsigned int maxsize = 0;
-	unsigned char dive[RB_LOGBOOK_COUNT] = {0};
-	for (unsigned int i = 0; i < RB_LOGBOOK_COUNT; ++i) {
-		unsigned int idx = (latest + RB_LOGBOOK_COUNT - i) % RB_LOGBOOK_COUNT;
-		unsigned int offset = idx * logbook->size;
-
-		// Ignore uninitialized header entries.
-		if (array_isequal (header + offset, logbook->size, 0xFF)) {
-			WARNING (abstract->context, "Unexpected empty header found.");
-			continue;
-		}
-
-
-		// Calculate the profile length.
-		unsigned int length = 0;
-		if (device->frog) {
-			// Get the ringbuffer pointers.
-			unsigned int begin = array_uint24_le (header + offset + logbook->pointers);
-			unsigned int end   = array_uint24_le (header + offset + logbook->pointers + 3);
-			if (begin < RB_PROFILE_BEGIN ||
-				begin >= RB_PROFILE_END ||
-				end < RB_PROFILE_BEGIN ||
-				end >= RB_PROFILE_END)
-			{
-				ERROR (abstract->context, "Invalid ringbuffer pointer detected (0x%06x 0x%06x).", begin, end);
-				free (header);
-				return DC_STATUS_DATAFORMAT;
-			}
-
-			length = RB_LOGBOOK_SIZE_FULL + RB_PROFILE_DISTANCE (begin, end) - 6;
-		} else {
-			length = RB_LOGBOOK_SIZE_FULL + array_uint24_le (header + offset + logbook->profile) - 3;
-			if (!compact) {
-				// Workaround for a bug in older firmware versions.
-				unsigned int firmware = array_uint16_be (header + offset + logbook->firmware);
-				if (firmware < OSTC3FW(0,93))
-					length -= 3;
-			}
-		}
-		// OSTC 4/5 firmware stores the profile length in the (compact) dive
-		// header 3 bytes higher than what is actually transmitted in the dive
-		// download response. The same delta is already encoded for the
-		// post-download validation step (see `delta = ISHWOS4(...) ? 3 : 0`).
-		// Without this correction the read of the dive profile expects 3 more
-		// bytes than the OSTC sends and times out with DC_STATUS_IO.
-		if (ISHWOS4(device->hardware))
-			length -= 3;
-		if (length < RB_LOGBOOK_SIZE_FULL) {
-			WARNING (abstract->context, "Skipping dive entry %u: profile length too small (%u bytes).", idx, length);
-			continue;
-		}
-		// Guard against corrupt headers with an implausibly large profile
-		// length (e.g. flash-erased slots with non-0xFF residue). Requesting
-		// such a transfer from the OSTC4/5 causes the firmware to disconnect.
-		if (length > SZ_MEMORY) {
-			WARNING (abstract->context, "Skipping dive entry %u: profile length (%u bytes) exceeds flash size.", idx, length);
-			continue;
-		}
-
-		// Check the fingerprint data.
-		if (memcmp (header + offset + logbook->fingerprint, device->fingerprint, sizeof (device->fingerprint)) == 0)
-			break;
-
-		if (length > maxsize)
-			maxsize = length;
-		size += length;
-		dive[ndives] = idx;
-		ndives++;
-	}
+	INFO (abstract->context, "Dives to download: %u (selection: %u)", ndives, device->nselection);
 
 	// Update and emit a progress event.
 	progress.maximum = (logbook->size * RB_LOGBOOK_COUNT) + size + ndives;
@@ -1088,30 +1299,7 @@ hw_ostc3_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, voi
 		unsigned int offset = idx * logbook->size;
 
 		// Calculate the profile length.
-		unsigned int length = 0;
-		if (device->frog) {
-			// Get the ringbuffer pointers.
-			unsigned int begin = array_uint24_le (header + offset + logbook->pointers);
-			unsigned int end   = array_uint24_le (header + offset + logbook->pointers + 3);
-
-			length = RB_LOGBOOK_SIZE_FULL + RB_PROFILE_DISTANCE (begin, end) - 6;
-		} else {
-			length = RB_LOGBOOK_SIZE_FULL + array_uint24_le (header + offset + logbook->profile) - 3;
-			if (!compact) {
-				// Workaround for a bug in older firmware versions.
-				unsigned int firmware = array_uint16_be (header + offset + logbook->firmware);
-				if (firmware < OSTC3FW(0,93))
-					length -= 3;
-			}
-		}
-		// OSTC 4/5 firmware stores the profile length in the (compact) dive
-		// header 3 bytes higher than what is actually transmitted in the dive
-		// download response. The same delta is already encoded for the
-		// post-download validation step (see `delta = ISHWOS4(...) ? 3 : 0`).
-		// Without this correction the read of the dive profile expects 3 more
-		// bytes than the OSTC sends and times out with DC_STATUS_IO.
-		if (ISHWOS4(device->hardware))
-			length -= 3;
+		unsigned int length = hw_ostc3_profile_length (device, header + offset, logbook, compact);
 
 		// Download the dive.
 		unsigned char number[1] = {idx};
